@@ -9,7 +9,8 @@
 
 ## 👥 **Prepared By:**  
 - 💼 Islam El-Sayed Ahmed  
-- 💼 Abdelrahman Mohammed Ahmed  
+- 💼 Abdelrahman Mohammed Ahmed
+- 💼 Abdelrahman Tarek Sayed 
 - 💼 Omar Salah Kamel Elmasry  
 - 💼 Ahmed Elsayed Rozan  
 - 💼 Mohammed Alsaeid Mohammed  
@@ -146,6 +147,6 @@ Metasploitable 3 is **extremely vulnerable** by design and should **never** be e
 - **✅** Replace all default/weak credentials
 - **✅** Implement strict firewall rules (allow only necessary ports from trusted IPs)
 - **✅** Disable unnecessary services (e.g., development tools, backdoored packages)
-- **✅** Follow least privilege principle
+- **✅** Follow the least privilege principle
 - **✅** Regular patching and security audits
 - **✅** Enable proper logging and monitoring
