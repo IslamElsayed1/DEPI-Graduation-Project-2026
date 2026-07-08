@@ -1,1 +1,1 @@
-# Graduation-project-at-DEPI-24
+# DEPI-Graduation-Project-2026
