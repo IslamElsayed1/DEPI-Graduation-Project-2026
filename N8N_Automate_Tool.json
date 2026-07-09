@@ -1,0 +1,654 @@
+{
+  "name": "scanner",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "7e32da66-8577-45ca-82b2-705d7970fe03",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        -112,
+        272
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "network",
+              "type": "string",
+              "value": "={{$json.network}}"
+            },
+            {
+              "id": "2",
+              "name": "timestamp",
+              "type": "string",
+              "value": "={{$now.toFormat(\"yyyy-MM-dd_HH-mm-ss\")}}"
+            },
+            {
+              "id": "0a15fc2e-83fa-4f10-bfc4-5031a2b3381c",
+              "name": "report_password",
+              "type": "string",
+              "value": "el-joker"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "50405635-3849-4c16-8edb-ebdaba222d58",
+      "name": "1. Set Parameters",
+      "type": "n8n-nodes-base.set",
+      "position": [
+        640,
+        288
+      ],
+      "typeVersion": 3.3,
+      "notes": "Configure scan parameters"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/tmp/logs/scan_data_{{ $('1. Set Parameters').item.json.timestamp }}.json",
+        "dataPropertyName": "=data",
+        "options": {}
+      },
+      "id": "258aa556-298c-4523-b1fa-757b08e5ce3e",
+      "name": "4. Save Scan Data to File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "position": [
+        1456,
+        272
+      ],
+      "typeVersion": 1,
+      "notes": "Persist parsed scan data"
+    },
+    {
+      "parameters": {
+        "jsCode": "// CVE ENRICHMENT - Query NVD API for each service\nconst services = $input.first().json.services;\nconst enriched = [];\n\nconsole.log('=== CVE ENRICHMENT START ===');\nconsole.log(`Processing ${services.length} services`);\n\nfor (let i = 0; i < services.length; i++) {\n  const service = services[i];\n  const base = {\n    ip: service.ip,\n    port: service.port,\n    protocol: service.protocol,\n    service: service.service,\n    product: service.product,\n    version: service.version,\n    cpe: service.cpe,\n    serviceKey: service.serviceKey\n  };\n\n  // --- OVERRIDE: nginx vendor fix ---\nif (base.product && base.product.toLowerCase() === 'nginx' && base.cpe) {\n  base.cpe = base.cpe.replace('igor_sysoev', 'nginx');\n}\n\n  console.log(`[${i+1}/${services.length}] ${base.ip}:${base.port} ${base.service} ${base.product} ${base.version}`);\n\n  // Check if CPE exists\n  if (!base.cpe || base.cpe === '' || base.cpe === ':') {\n    console.log('  → No CPE, skipping CVE lookup');\n    enriched.push({\n      ...base,\n      cveId: 'N/A',\n      cveSummary: 'No CPE available for vulnerability lookup',\n      cvssScore: 0,\n      severity: 'INFO',\n      publishedDate: 'N/A',\n      references: []\n    });\n    continue;\n  }\n\n  console.log(`  → CPE: ${base.cpe}`);\n\n  try {\n    // Query NVD CVE API\n    const apiUrl = `https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=${encodeURIComponent(base.cpe)}&resultsPerPage=10&isVulnerable`;\n    console.log('  → Querying NVD API...');\n\nconst response = await this.helpers.httpRequest({\n  method: 'GET',\n  url: apiUrl,\n  timeout: 30000,\n  headers: {\n    'User-Agent': 'n8n-vulnerability-scanner/1.0'\n  }\n});\n\n\n    const vulnerabilities = response.vulnerabilities || [];\n    console.log(`  → Found ${vulnerabilities.length} CVEs`);\n\n    if (vulnerabilities.length === 0) {\n      enriched.push({\n        ...base,\n        cveId: 'N/A',\n        cveSummary: 'No known vulnerabilities found in NVD database',\n        cvssScore: 0,\n        severity: 'INFO',\n        publishedDate: 'N/A',\n        references: []\n      });\n    } else {\n      // Process each CVE\n      for (const vuln of vulnerabilities) {\n        const cve = vuln.cve || {};\n        const cveId = cve.id || 'UNKNOWN';\n\n        // Get English description\n        const descriptions = cve.descriptions || [];\n        const cveSummary = descriptions.find(d => d.lang === 'en')?.value || 'No description available';\n\n        // Get CVSS metrics\n        const metrics = cve.metrics || {};\n        const cvssV31 = metrics.cvssMetricV31?.[0]?.cvssData;\n        const cvssV30 = metrics.cvssMetricV30?.[0]?.cvssData;\n        const cvssData = cvssV31 || cvssV30 || {};\n\n        const cvssScore = cvssData.baseScore || 0;\n        const severity = cvssData.baseSeverity || 'UNKNOWN';\n\n        // Get published date\n        const publishedDate = cve.published || 'N/A';\n\n        // Get references (limit to 3)\n        const references = (cve.references || []).slice(0, 3).map(ref => ref.url);\n\n        enriched.push({\n          ...base,\n          cveId,\n          cveSummary,\n          cvssScore,\n          severity,\n          publishedDate,\n          references\n        });\n\n        console.log(`    - ${cveId} (${severity}, CVSS: ${cvssScore})`);\n      }\n    }\n\n    // Rate limiting: 1 seconds between requests\n    if (i < services.length - 1) {\n      console.log('  → Waiting 1s (rate limit)...');\n      await new Promise(resolve => setTimeout(resolve, 1000));\n    }\n\n  } catch (error) {\n    console.log(`  ✗ API ERROR: ${error.message}`);\n    enriched.push({\n      ...base,\n      cveId: 'N/A',\n      cveSummary: `API Error: ${error.message}`,\n      cvssScore: 0,\n      severity: 'ERROR',\n      publishedDate: 'N/A',\n      references: []\n    });\n  }\n}\n\nconsole.log(`=== CVE ENRICHMENT COMPLETE: ${enriched.length} results ===`);\n// return enriched.map(item => ({json: item}));\n\n\n// JSON string\nconst outputContent = JSON.stringify(enriched, null, 2);\n\n// Buffer\nconst buffer = Buffer.from(outputContent, 'utf-8');\n\n// Return \nreturn [{\n  json: { enriched: enriched },\n  binary: {\n    data: {\n      data: buffer.toString('base64'),\n      mimeType: 'application/json',\n      fileName: 'enriched.json'\n    }\n  }\n}];\n"
+      },
+      "id": "669fbecb-18cb-462b-a7f5-2eac0a016c5e",
+      "name": "5. CVE Enrichment Loop",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1712,
+        80
+      ],
+      "typeVersion": 2,
+      "notes": "Query NVD CVE API for each service with rate limiting"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/tmp/logs/enriched_data_{{ $('1. Set Parameters').item.json.timestamp }}.json",
+        "dataPropertyName": "=data",
+        "options": {}
+      },
+      "id": "69b31e4f-3be7-4a87-8133-82cdc758fb11",
+      "name": "6. Save Enriched Data",
+      "type": "n8n-nodes-base.readWriteFile",
+      "position": [
+        2000,
+        272
+      ],
+      "typeVersion": 1,
+      "notes": "Persist CVE-enriched data"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "include": "specifiedFields",
+        "fieldsToInclude": "enriched, services",
+        "options": {}
+      },
+      "id": "b804ead4-d5ad-4e78-8c1c-53f123cec176",
+      "name": "7. Aggregate All Data",
+      "type": "n8n-nodes-base.aggregate",
+      "position": [
+        2352,
+        112
+      ],
+      "typeVersion": 1,
+      "notes": "Collect all enriched items"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare report data structure - FIXED for nested array structure\nconst input = $input.first().json;\nconst network = $('1. Set Parameters').first().json.network;\n\nconsole.log('=== PREPARING REPORT ===');\nconsole.log('Input type:', typeof input);\nconsole.log('Input keys:', Object.keys(input));\n\n// FIXED: Handle triple-nested structure [{ data: [{ enriched: [...] }] }]\nlet allData = [];\n\n// Step 1: Extract from data array\nif (input.data && Array.isArray(input.data)) {\n  console.log('Found data array, length:', input.data.length);\n\n  // Step 2: data is an array, get first element\n  if (input.data.length > 0) {\n    const dataFirstItem = input.data[0];\n    console.log('First data item keys:', Object.keys(dataFirstItem));\n\n    // Step 3: Extract enriched array\n    if (dataFirstItem.enriched && Array.isArray(dataFirstItem.enriched)) {\n      allData = dataFirstItem.enriched;\n      console.log('✓ Found enriched array in data[0].enriched, length:', allData.length);\n    } else {\n      console.log('ERROR: No enriched array in data[0]');\n    }\n  }\n} else {\n  console.log('ERROR: No data array found');\n}\n\n// Fallback: check other possible structures\nif (allData.length === 0) {\n  console.log('Trying fallback extraction methods...');\n\n  if (input.enriched && Array.isArray(input.enriched)) {\n    allData = input.enriched;\n    console.log('Found in input.enriched');\n  } else if (Array.isArray(input)) {\n    allData = input;\n    console.log('Input itself is array');\n  }\n}\n\nconsole.log(`Processing ${allData.length} enriched items`);\n\nif (allData.length === 0) {\n  console.log('ERROR: No data found! Full input:', JSON.stringify(input, null, 2));\n}\n\n// Group data by IP address\nconst hostsByIp = {};\n\nfor (const item of allData) {\n  console.log('Processing item:', item.ip, item.port, item.service);\n\n  const ip = item.ip;\n  const port = item.port;\n\n  // Skip undefined values\n  if (!ip || !port) {\n    console.log('Skipping item with undefined ip or port');\n    continue;\n  }\n\n  // Initialize host if not exists\n  if (!hostsByIp[ip]) {\n    hostsByIp[ip] = {\n      ip: ip,\n      hostname: ip,\n      services: {}\n    };\n    console.log(`Initialized host: ${ip}`);\n  }\n\n  // Initialize service/port if not exists\n  if (!hostsByIp[ip].services[port]) {\n    hostsByIp[ip].services[port] = {\n      port: port,\n      protocol: item.protocol,\n      service: item.service,\n      product: item.product,\n      version: item.version,\n      cpe: item.cpe,\n      vulnerabilities: []\n    };\n    console.log(`  Added service: ${port}/${item.protocol} ${item.service}`);\n  }\n\n  // Add vulnerability if CVE exists\n  if (item.cveId && item.cveId !== 'N/A') {\n    hostsByIp[ip].services[port].vulnerabilities.push({\n      cveId: item.cveId,\n      cveSummary: item.cveSummary,\n      cvssScore: item.cvssScore,\n      severity: item.severity,\n      publishedDate: item.publishedDate,\n      references: item.references\n    });\n    console.log(`    Added CVE: ${item.cveId} (${item.severity})`);\n  }\n}\n\nconsole.log('Hosts found:', Object.keys(hostsByIp));\n\n// Calculate statistics\nlet totalVulnerabilities = 0;\nlet criticalCount = 0;\nlet highCount = 0;\nlet mediumCount = 0;\nlet lowCount = 0;\nlet infoCount = 0;\nlet totalServices = 0;\n\nfor (const ip in hostsByIp) {\n  for (const port in hostsByIp[ip].services) {\n    totalServices++;\n    const vulns = hostsByIp[ip].services[port].vulnerabilities;\n    totalVulnerabilities += vulns.length;\n\n    for (const vuln of vulns) {\n      const severity = (vuln.severity || 'INFO').toLowerCase();\n      if (severity === 'critical') criticalCount++;\n      else if (severity === 'high') highCount++;\n      else if (severity === 'medium') mediumCount++;\n      else if (severity === 'low') lowCount++;\n      else infoCount++;\n    }\n  }\n}\n\nconst statistics = {\n  totalHosts: Object.keys(hostsByIp).length,\n  totalServices: totalServices,\n  totalVulnerabilities: totalVulnerabilities,\n  criticalCount: criticalCount,\n  highCount: highCount,\n  mediumCount: mediumCount,\n  lowCount: lowCount,\n  infoCount: infoCount,\n  scanDate: new Date().toISOString().split('T')[0],\n  scanTime: new Date().toISOString().split('T')[1].split('.')[0]\n};\n\nconsole.log(`✓ Statistics: ${statistics.totalHosts} hosts, ${statistics.totalServices} services, ${statistics.totalVulnerabilities} vulnerabilities`);\nconsole.log(`  - Critical: ${criticalCount}, High: ${highCount}, Medium: ${mediumCount}, Low: ${lowCount}, Info: ${infoCount}`);\n\nconst report = {\n  metadata: {\n    title: 'Network Infrastructure Vulnerability Assessment Report',\n    subtitle: 'Comprehensive Security Analysis',\n    version: '1.0.0',\n    scanDate: statistics.scanDate,\n    scanTime: statistics.scanTime,\n    scanNetwork: network\n  },\n  statistics: statistics,\n  executiveSummary: `This vulnerability assessment analyzed the network ${network}. ` +\n    `The scan identified ${statistics.totalHosts} active hosts with ${statistics.totalServices} exposed services. ` +\n    `A total of ${statistics.totalVulnerabilities} vulnerabilities were discovered, ` +\n    `including ${statistics.criticalCount} critical, ${statistics.highCount} high, ` +\n    `${statistics.mediumCount} medium, ${statistics.lowCount} low severity issues, ` +\n    `and ${statistics.infoCount} informational findings.`,\n  hostData: hostsByIp\n};\n\nconsole.log('✓ Report structure prepared successfully');\nconsole.log('Host IPs:', Object.keys(hostsByIp));\n\nreturn [{json: report}];"
+      },
+      "id": "e9dacd3a-bb16-44b2-b085-d1c617f2101a",
+      "name": "8. Prepare Report Structure",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2608,
+        288
+      ],
+      "typeVersion": 2,
+      "notes": "Group by IP, calculate statistics"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate Professional HTML Report\nconst report = items[0].json;\nconst meta = report.metadata;\nconst stats = report.statistics;\nconst hosts = report.hostData;\n\nconsole.log('=== GENERATING HTML REPORT ===');\n\n// Helper functions\nfunction severityColor(severity) {\n  const colors = {\n    'critical': '#c62828',\n    'high': '#f57c00',\n    'medium': '#fbc02d',\n    'low': '#388e3c',\n    'info': '#1976d2',\n    'error': '#9e9e9e',\n    'unknown': '#757575'\n  };\n  return colors[(severity || 'info').toLowerCase()] || '#757575';\n}\n\nfunction severityBadge(severity) {\n  const color = severityColor(severity);\n  return `<span class=\"severity-badge\" style=\"background-color:${color}\">${(severity || 'INFO').toUpperCase()}</span>`;\n}\n\nfunction generateServiceTable(host) {\n  let html = '<table class=\"service-table\"><thead><tr>';\n  html += '<th>Port</th><th>Protocol</th><th>Service</th><th>Product</th><th>Version</th><th>CVE Count</th><th>Max Severity</th>';\n  html += '</tr></thead><tbody>';\n\n  for (const portKey in host.services) {\n    const svc = host.services[portKey];\n    const vulnCount = svc.vulnerabilities.length;\n\n    let maxSeverity = 'INFO';\n    if (vulnCount > 0) {\n      const severities = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];\n      for (const sev of severities) {\n        if (svc.vulnerabilities.some(v => (v.severity || '').toUpperCase() === sev)) {\n          maxSeverity = sev;\n          break;\n        }\n      }\n    }\n\n    html += '<tr>';\n    html += `<td><strong>${svc.port}</strong></td>`;\n    html += `<td>${svc.protocol}</td>`;\n    html += `<td>${svc.service}</td>`;\n    html += `<td>${svc.product || '-'}</td>`;\n    html += `<td>${svc.version || '-'}</td>`;\n    html += `<td>${vulnCount}</td>`;\n    html += `<td>${severityBadge(maxSeverity)}</td>`;\n    html += '</tr>';\n  }\n\n  html += '</tbody></table>';\n  return html;\n}\n\nfunction generateVulnerabilityDetails(host) {\n  let html = '';\n\n  for (const portKey in host.services) {\n    const svc = host.services[portKey];\n\n    html += `<div class=\"port-section\">`;\n    html += `<h4 class=\"port-title\">Port ${svc.port}/${svc.protocol} - ${svc.service}</h4>`;\n    html += `<div class=\"service-info\">`;\n    html += `<strong>Product:</strong> ${svc.product || 'Unknown'} `;\n    html += `<strong>Version:</strong> ${svc.version || 'Unknown'}`;\n    if (svc.cpe) {\n      html += `<br><strong>CPE:</strong> <code>${svc.cpe}</code>`;\n    }\n    html += `</div>`;\n\n    if (svc.vulnerabilities.length === 0) {\n      html += `<div class=\"no-vuln\">No known vulnerabilities found for this service.</div>`;\n    } else {\n      html += `<div class=\"vulnerabilities\">`;\n      for (const vuln of svc.vulnerabilities) {\n        html += `<div class=\"vulnerability-card\">`;\n        html += `<div class=\"vuln-header\">`;\n        html += `<span class=\"cve-id\">${vuln.cveId}</span>`;\n        html += severityBadge(vuln.severity);\n        html += `<span class=\"cvss-score\">CVSS: ${vuln.cvssScore}</span>`;\n        html += `</div>`;\n        html += `<div class=\"vuln-published\">Published: ${vuln.publishedDate}</div>`;\n        html += `<div class=\"vuln-description\">${vuln.cveSummary}</div>`;\n        if (vuln.references && vuln.references.length > 0) {\n          html += `<div class=\"vuln-references\"><strong>References:</strong><ul>`;\n          for (const ref of vuln.references) {\n            html += `<li><a href=\"${ref}\" target=\"_blank\">${ref}</a></li>`;\n          }\n          html += `</ul></div>`;\n        }\n        html += `</div>`;\n      }\n      html += `</div>`;\n    }\n\n    html += `</div>`;\n  }\n\n  return html;\n}\n\n// Build HTML\nlet html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>${meta.title}</title>\n  <style>\n    * { margin: 0; padding: 0; box-sizing: border-box; }\n    body {\n      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;\n      line-height: 1.6;\n      color: #333;\n      background-color: #f5f5f5;\n    }\n    .container {\n      max-width: 1200px;\n      margin: 0 auto;\n      padding: 20px;\n      background-color: white;\n      box-shadow: 0 0 20px rgba(0,0,0,0.1);\n    }\n    .header {\n      background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%);\n      color: white;\n      padding: 40px 30px;\n      margin: -20px -20px 30px -20px;\n    }\n    .header h1 {\n      font-size: 28px;\n      margin-bottom: 10px;\n    }\n    .header .subtitle {\n      font-size: 16px;\n      opacity: 0.9;\n    }\n    .meta-info {\n      background-color: #f9f9f9;\n      border-left: 4px solid #1976d2;\n      padding: 15px 20px;\n      margin-bottom: 30px;\n    }\n    .meta-info div {\n      margin: 5px 0;\n    }\n    h2 {\n      color: #1976d2;\n      font-size: 24px;\n      margin: 40px 0 20px 0;\n      padding-bottom: 10px;\n      border-bottom: 2px solid #e0e0e0;\n    }\n    h3 {\n      color: #424242;\n      font-size: 20px;\n      margin: 30px 0 15px 0;\n    }\n    h4 {\n      color: #616161;\n      font-size: 18px;\n      margin: 20px 0 10px 0;\n    }\n    .stats-grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));\n      gap: 20px;\n      margin: 20px 0;\n    }\n    .stat-card {\n      background-color: #f9f9f9;\n      padding: 20px;\n      border-radius: 8px;\n      border-left: 4px solid #1976d2;\n    }\n    .stat-card .label {\n      font-size: 14px;\n      color: #757575;\n      margin-bottom: 8px;\n    }\n    .stat-card .value {\n      font-size: 32px;\n      font-weight: bold;\n      color: #1976d2;\n    }\n    .severity-breakdown {\n      display: flex;\n      gap: 15px;\n      margin: 20px 0;\n      flex-wrap: wrap;\n    }\n    .severity-item {\n      flex: 1;\n      min-width: 120px;\n      padding: 15px;\n      background-color: #f9f9f9;\n      border-radius: 6px;\n      text-align: center;\n    }\n    .severity-item .count {\n      font-size: 28px;\n      font-weight: bold;\n      margin-bottom: 5px;\n    }\n    .severity-item .label {\n      font-size: 12px;\n      text-transform: uppercase;\n      font-weight: 600;\n    }\n    .severity-badge {\n      display: inline-block;\n      padding: 4px 12px;\n      border-radius: 4px;\n      color: white;\n      font-size: 12px;\n      font-weight: 600;\n      text-transform: uppercase;\n    }\n    .service-table {\n      width: 100%;\n      border-collapse: collapse;\n      margin: 20px 0;\n      background-color: white;\n      box-shadow: 0 1px 3px rgba(0,0,0,0.1);\n    }\n    .service-table th,\n    .service-table td {\n      padding: 12px;\n      text-align: left;\n      border-bottom: 1px solid #e0e0e0;\n    }\n    .service-table th {\n      background-color: #f5f5f5;\n      font-weight: 600;\n      color: #424242;\n      text-transform: uppercase;\n      font-size: 12px;\n    }\n    .service-table tr:hover {\n      background-color: #fafafa;\n    }\n    .port-section {\n      margin: 30px 0;\n      padding: 20px;\n      background-color: #fafafa;\n      border-radius: 8px;\n    }\n    .port-title {\n      color: #1976d2;\n      margin-bottom: 10px;\n    }\n    .service-info {\n      margin: 10px 0;\n      padding: 10px;\n      background-color: white;\n      border-radius: 4px;\n      font-size: 14px;\n    }\n    .service-info code {\n      background-color: #f5f5f5;\n      padding: 2px 6px;\n      border-radius: 3px;\n      font-size: 12px;\n    }\n    .no-vuln {\n      margin: 15px 0;\n      padding: 15px;\n      background-color: #e8f5e9;\n      color: #388e3c;\n      border-radius: 4px;\n      border-left: 4px solid #4caf50;\n    }\n    .vulnerabilities {\n      margin: 15px 0;\n    }\n    .vulnerability-card {\n      margin: 15px 0;\n      padding: 20px;\n      background-color: white;\n      border-radius: 6px;\n      border-left: 4px solid #f57c00;\n      box-shadow: 0 2px 4px rgba(0,0,0,0.1);\n    }\n    .vuln-header {\n      display: flex;\n      gap: 15px;\n      align-items: center;\n      margin-bottom: 10px;\n    }\n    .cve-id {\n      font-size: 18px;\n      font-weight: bold;\n      color: #1976d2;\n    }\n    .cvss-score {\n      font-size: 14px;\n      font-weight: 600;\n      color: #757575;\n    }\n    .vuln-published {\n      font-size: 13px;\n      color: #757575;\n      margin-bottom: 10px;\n    }\n    .vuln-description {\n      margin: 15px 0;\n      line-height: 1.7;\n    }\n    .vuln-references {\n      margin-top: 15px;\n      font-size: 14px;\n    }\n    .vuln-references ul {\n      margin: 10px 0 0 20px;\n    }\n    .vuln-references a {\n      color: #1976d2;\n      text-decoration: none;\n      word-break: break-all;\n    }\n    .vuln-references a:hover {\n      text-decoration: underline;\n    }\n    .executive-summary {\n      background-color: #e3f2fd;\n      padding: 20px;\n      border-radius: 6px;\n      border-left: 4px solid #1976d2;\n      margin: 20px 0;\n      line-height: 1.8;\n    }\n    .recommendations {\n      background-color: #fff3e0;\n      padding: 20px;\n      border-radius: 6px;\n      border-left: 4px solid #f57c00;\n      margin: 20px 0;\n    }\n    .recommendations ul {\n      margin: 15px 0 0 20px;\n      line-height: 2;\n    }\n    @media print {\n      .container {\n        box-shadow: none;\n      }\n      .header {\n        background: #1976d2;\n        -webkit-print-color-adjust: exact;\n        print-color-adjust: exact;\n      }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <div class=\"header\">\n      <h1>${meta.title}</h1>\n      <div class=\"subtitle\">${meta.subtitle}</div>\n    </div>\n\n    <div class=\"meta-info\">\n      <div><strong>Target Network:</strong> ${meta.scanNetwork}</div>\n      <div><strong>Scan Date:</strong> ${meta.scanDate} ${meta.scanTime}</div>\n      <div><strong>Report Version:</strong> ${meta.version}</div>\n    </div>\n\n    <h2>Executive Summary</h2>\n    <div class=\"executive-summary\">\n      ${report.executiveSummary}\n    </div>\n\n    <h2>Overall Statistics</h2>\n    <div class=\"stats-grid\">\n      <div class=\"stat-card\">\n        <div class=\"label\">Total Hosts</div>\n        <div class=\"value\">${stats.totalHosts}</div>\n      </div>\n      <div class=\"stat-card\">\n        <div class=\"label\">Total Services</div>\n        <div class=\"value\">${stats.totalServices}</div>\n      </div>\n      <div class=\"stat-card\">\n        <div class=\"label\">Total Vulnerabilities</div>\n        <div class=\"value\">${stats.totalVulnerabilities}</div>\n      </div>\n    </div>\n\n    <h3>Vulnerability Breakdown by Severity</h3>\n    <div class=\"severity-breakdown\">\n      <div class=\"severity-item\" style=\"border-top: 4px solid ${severityColor('critical')}\">\n        <div class=\"count\" style=\"color: ${severityColor('critical')}\">${stats.criticalCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('critical')}\">Critical</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top: 4px solid ${severityColor('high')}\">\n        <div class=\"count\" style=\"color: ${severityColor('high')}\">${stats.highCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('high')}\">High</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top: 4px solid ${severityColor('medium')}\">\n        <div class=\"count\" style=\"color: ${severityColor('medium')}\">${stats.mediumCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('medium')}\">Medium</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top: 4px solid ${severityColor('low')}\">\n        <div class=\"count\" style=\"color: ${severityColor('low')}\">${stats.lowCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('low')}\">Low</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top: 4px solid ${severityColor('info')}\">\n        <div class=\"count\" style=\"color: ${severityColor('info')}\">${stats.infoCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('info')}\">Info</div>\n      </div>\n    </div>\n\n    <h2>Detailed Findings by Host</h2>`;\n\n// Generate per-host sections\nfor (const ip in hosts) {\n  const host = hosts[ip];\n  html += `\n    <h3>Host: ${host.ip}</h3>\n    <h4>Discovered Services</h4>\n    ${generateServiceTable(host)}\n    <h4>Vulnerability Details</h4>\n    ${generateVulnerabilityDetails(host)}\n  `;\n}\n\nhtml += `\n    <h2>Recommendations</h2>\n    <div class=\"recommendations\">\n      <p><strong>Immediate Actions:</strong></p>\n      <ul>\n        <li>Prioritize patching of CRITICAL and HIGH severity vulnerabilities</li>\n        <li>Review and update all services showing outdated versions</li>\n        <li>Disable or restrict access to unnecessary services</li>\n        <li>Implement network segmentation to limit exposure</li>\n      </ul>\n      <p><strong>Long-term Improvements:</strong></p>\n      <ul>\n        <li>Establish regular vulnerability scanning schedule (weekly/monthly)</li>\n        <li>Implement automated patch management processes</li>\n        <li>Deploy intrusion detection/prevention systems (IDS/IPS)</li>\n        <li>Conduct security awareness training for staff</li>\n        <li>Maintain asset inventory and track software versions</li>\n      </ul>\n    </div>\n  </div>\n</body>\n</html>`;\n\nconsole.log('HTML report generated successfully');\n\n// Return as both JSON and binary\nconst buffer = Buffer.from(html, 'utf-8');\nreturn [{\n  json: { html: html },\n  binary: {\n    data: {\n      data: buffer.toString('base64'),\n      mimeType: 'text/html',\n      fileName: 'vulnerability_report.html'\n    }\n  }\n}];"
+      },
+      "id": "123c5d89-3add-49f0-870c-20f3087d80cf",
+      "name": "9. Generate HTML Report",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2880,
+        112
+      ],
+      "typeVersion": 2,
+      "notes": "Professional HTML report with styling"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/tmp/logs/vulnerability_report_{{ $('1. Set Parameters').item.json.timestamp }}.html",
+        "dataPropertyName": "=data",
+        "options": {}
+      },
+      "id": "b8db1673-0b5c-4828-b8fc-302cbd842fa9",
+      "name": "10. Save Report to File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "position": [
+        3136,
+        304
+      ],
+      "typeVersion": 1,
+      "notes": "Write HTML report to /tmp"
+    },
+    {
+      "parameters": {
+        "fileSelector": "=/tmp/logs/vulnerability_report_{{ $('1. Set Parameters').item.json.timestamp }}.html",
+        "options": {}
+      },
+      "id": "e3ac66db-738f-40ed-ada9-28a8877ddc4d",
+      "name": "11. Read Report for Output",
+      "type": "n8n-nodes-base.readWriteFile",
+      "position": [
+        3456,
+        112
+      ],
+      "typeVersion": 1,
+      "notes": "Return report file"
+    },
+    {
+      "parameters": {
+        "content": "## Get CVE datas\n**CPE Search** : https://nvd.nist.gov/products/cpe/search\n**CVE Search** : https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName={CPE Tag}&resultsPerPage=10&isVulnerable",
+        "height": 128,
+        "width": 816,
+        "color": 5
+      },
+      "id": "3637699e-3929-4961-9c78-fbfc5342e57a",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        1104,
+        -608
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "fileSelector": "=/tmp/logs/vulnerability_report_{{ $('1. Set Parameters').item.json.timestamp }}.pdf",
+        "options": {
+          "dataPropertyName": "=vulnerability_report"
+        }
+      },
+      "id": "85ef9423-361f-4372-8170-53062674bc49",
+      "name": "13. Read Report PDF for Output",
+      "type": "n8n-nodes-base.readWriteFile",
+      "position": [
+        4048,
+        64
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5767d8e7-5746-4713-8a22-9b2cea985269",
+              "name": "network",
+              "type": "string",
+              "value": "192.168.16.128"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "833b8aee-0862-4851-9be0-767df55747e2",
+      "name": "Pre-Set-Target",
+      "type": "n8n-nodes-base.set",
+      "position": [
+        320,
+        288
+      ],
+      "typeVersion": 3.4
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "id": "96632fbb-2b00-4cec-ba9e-cb9659e231a8",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [
+        -112,
+        -176
+      ],
+      "typeVersion": 1.2
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\n\nconst nmapJson = raw.stdout ? JSON.parse(raw.stdout) : raw;\n\nlet services = [];\n\nconst hosts = nmapJson.host || [];\nfor (const host of hosts) {\n  const ip = host.address?.[0]?.addr || 'unknown';\n  const ports = host.ports?.port || [];\n\n  for (const portObj of ports) {\n    if (portObj.state?.state !== 'open') continue;\n\n    const serviceObj = portObj.service || {};\n    services.push({\n      ip,\n      port: portObj.portid,\n      protocol: portObj.protocol,\n      service: serviceObj.name || 'unknown',\n      product: serviceObj.product || '',\n      version: serviceObj.version || '',\n      cpe: Array.isArray(serviceObj.cpe) && serviceObj.cpe.length > 0\n        ? serviceObj.cpe[0].replace(/^cpe:\\//, 'cpe:2.3:') + ':'\n        : '',\n      serviceKey: `${ip}:${portObj.portid}`\n    });\n  }\n}\n\nconst outputContent = JSON.stringify(services, null, 2);\nconst buffer = Buffer.from(outputContent, 'utf-8');\n\nreturn [{\n  json: { services: services },\n  binary: {\n    data: {\n      data: buffer.toString('base64'),\n      mimeType: 'application/json',\n      fileName: 'services.json'\n    }\n  }\n}];\n"
+      },
+      "id": "5c1001da-905e-4acb-9759-0ea155e364f0",
+      "name": "3. Parse NMAP JSON to Services",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1200,
+        80
+      ],
+      "typeVersion": 2,
+      "notes": "Extract all services with details"
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "=1348976281",
+        "binaryData": true,
+        "binaryPropertyName": "vulnerability_report",
+        "additionalFields": {}
+      },
+      "id": "16026a90-bd77-4c15-889d-7ac4165097df",
+      "name": "14/a. Send Report in Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "position": [
+        4384,
+        272
+      ],
+      "webhookId": "5e17520f-66c7-4b4f-ac1e-9251beb4dd7c",
+      "typeVersion": 1.2,
+      "credentials": {
+        "telegramApi": {
+          "id": "Em9n9SxVRt5TYLch",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "993bd434-83d3-4c09-b9c9-d80ed1273802",
+              "name": "setter",
+              "type": "string",
+              "value": "-"
+            },
+            {
+              "id": "cd15bd15-9e15-4cd4-852b-fa3ab0ccbdf8",
+              "name": "max-retries",
+              "type": "string",
+              "value": "max-retries 2"
+            },
+            {
+              "id": "7906c4b3-05e6-4660-a22f-0a5ac056d42e",
+              "name": "min-parallelism",
+              "type": "string",
+              "value": "min-parallelism 40"
+            },
+            {
+              "id": "65ece4fd-13bd-4b94-b281-f2d1d5109e03",
+              "name": "max-parallelism",
+              "type": "string",
+              "value": "max-parallelism 250"
+            },
+            {
+              "id": "4c963160-4085-49ce-baaa-209f8b76ba81",
+              "name": "timing",
+              "type": "string",
+              "value": "-T4"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "365fe63b-63ed-46a0-b654-78b13e105905",
+      "name": "Optional Params Setter",
+      "type": "n8n-nodes-base.set",
+      "position": [
+        816,
+        80
+      ],
+      "typeVersion": 3.4
+    },
+    {
+      "parameters": {
+        "content": "## Dependency Check\n\nVerifies nmap-helper installation (converts Nmap XML to JSON). First run installs from GitHub; subsequent runs skip this step.\n\nhttps://github.com/net-shaper/nmap-helper\n\nhttps://crates.io/crates/nmap-helper",
+        "height": 220,
+        "width": 392,
+        "color": 5
+      },
+      "id": "e66aaaef-2188-41e7-9f79-f9ee6efbb83e",
+      "name": "Sticky Note - Dependency",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        96,
+        -640
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## CVE Enrichment\n\nQueries NVD API for each detected service using CPE identifiers. Returns CVE IDs, CVSS scores, severity levels, and references. Rate-limited to 1 req/sec.",
+        "height": 144,
+        "width": 420,
+        "color": 7
+      },
+      "id": "7fbbfa09-3607-4ffb-b4de-e3b0dc3ea358",
+      "name": "Sticky Note - CVE",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2176,
+        496
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "command": "=nmap -sS -sV {{$node[\"1. Set Parameters\"].json[\"network\"]}} -oX - | nmap-helper convert"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        992,
+        288
+      ],
+      "id": "6178fd10-d2e9-43e1-96fc-448778e41cb7",
+      "name": "Execute a command",
+      "credentials": {
+        "sshPassword": {
+          "id": "2ToZgLsB1YSXYHvR",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "command": "=prince /tmp/logs/vulnerability_report_{{$('1. Set Parameters').item.json.timestamp}}.html \\\n-o /tmp/logs/vulnerability_report_{{$('1. Set Parameters').item.json.timestamp}}.pdf \\\n--encrypt \\\n--key-bits=128 \\\n--user-password={{$('1. Set Parameters').item.json.report_password}}"
+      },
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        3712,
+        288
+      ],
+      "id": "82f3114a-41c0-4888-b24c-fd583bfbc63f",
+      "name": "Execute a command1",
+      "credentials": {
+        "sshPassword": {
+          "id": "2ToZgLsB1YSXYHvR",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vuln-scan",
+        "options": {
+          "responseData": "Process started!"
+        }
+      },
+      "id": "705e09ed-4a71-4abe-8b95-b95f3c6c8476",
+      "name": "Webhook1",
+      "type": "n8n-nodes-base.webhook",
+      "position": [
+        -112,
+        720
+      ],
+      "webhookId": "e1e1da83-efe3-4f81-8428-09f31ad3531a",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const report = items[0].json;\nconst meta = report.metadata;\nconst stats = report.statistics;\nconst hosts = report.hostData;\n\nfunction severityColor(severity) {\n  const colors = {\n    'critical': '#ef5350',\n    'high': '#ff9800',\n    'medium': '#ffd54f',\n    'low': '#66bb6a',\n    'info': '#42a5f5',\n    'error': '#9e9e9e',\n    'unknown': '#757575'\n  };\n  return colors[(severity || 'info').toLowerCase()] || '#757575';\n}\n\nfunction severityBadge(severity) {\n  const color = severityColor(severity);\n  return `<span class=\"severity-badge\" style=\"background-color:${color}20; color:${color}; border:1px solid ${color};\">${(severity || 'INFO').toUpperCase()}</span>`;\n}\n\nfunction generateServiceTable(host) {\n  let html = `<table class=\"service-table\">\n    <thead>\n      <tr>\n        <th>Port</th>\n        <th>Protocol</th>\n        <th>Service</th>\n        <th>Product</th>\n        <th>Version</th>\n        <th>CVE Count</th>\n        <th>Max Severity</th>\n      </tr>\n    </thead>\n    <tbody>`;\n\n  for (const portKey in host.services) {\n    const svc = host.services[portKey];\n    const vulnCount = svc.vulnerabilities ? svc.vulnerabilities.length : 0;\n    \n    let maxSeverity = 'INFO';\n    if (vulnCount > 0 && svc.vulnerabilities) {\n      const severities = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];\n      for (const sev of severities) {\n        if (svc.vulnerabilities.some(v => (v.severity || '').toUpperCase() === sev)) {\n          maxSeverity = sev;\n          break;\n        }\n      }\n    }\n\n    html += `<tr>\n      <td><strong>${svc.port}</strong></td>\n      <td>${svc.protocol || '-'}</td>\n      <td>${svc.service || '-'}</td>\n      <td>${svc.product || '-'}</td>\n      <td>${svc.version || '-'}</td>\n      <td><strong>${vulnCount}</strong></td>\n      <td>${severityBadge(maxSeverity)}</td>\n    </tr>`;\n  }\n\n  html += '</tbody></table>';\n  return html;\n}\n\nfunction generateVulnerabilityDetails(host) {\n  let html = '';\n\n  for (const portKey in host.services) {\n    const svc = host.services[portKey];\n\n    html += `<div class=\"port-section\">`;\n    html += `<h4 class=\"port-title\">Port ${svc.port}/${svc.protocol} - ${svc.service}</h4>`;\n    html += `<div class=\"service-info\">`;\n    html += `<strong>Product:</strong> ${svc.product || 'Unknown'} `;\n    html += `<strong>Version:</strong> ${svc.version || 'Unknown'}`;\n    if (svc.cpe) {\n      html += `<br><strong>CPE:</strong> <code>${svc.cpe}</code>`;\n    }\n    html += `</div>`;\n\n    if (svc.vulnerabilities.length === 0) {\n      html += `<div class=\"no-vuln\">No known vulnerabilities found for this service.</div>`;\n    } else {\n      html += `<div class=\"vulnerabilities\">`;\n      for (const vuln of svc.vulnerabilities) {\n        html += `<div class=\"vulnerability-card\">`;\n        html += `<div class=\"vuln-header\">`;\n        html += `<span class=\"cve-id\">${vuln.cveId}</span>`;\n        html += severityBadge(vuln.severity);\n        html += `<span class=\"cvss-score\">CVSS: ${vuln.cvssScore}</span>`;\n        html += `</div>`;\n        html += `<div class=\"vuln-published\">Published: ${vuln.publishedDate}</div>`;\n        html += `<div class=\"vuln-description\">${vuln.cveSummary}</div>`;\n        if (vuln.references && vuln.references.length > 0) {\n          html += `<div class=\"vuln-references\"><strong>References:</strong><ul>`;\n          for (const ref of vuln.references) {\n            html += `<li><a href=\"${ref}\" target=\"_blank\">${ref}</a></li>`;\n          }\n          html += `</ul></div>`;\n        }\n        html += `</div>`;\n      }\n      html += `</div>`;\n    }\n    html += `</div>`;\n  }\n  return html;\n}\n\nlet html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>${meta.title}</title>\n  <style>\n    * { margin: 0; padding: 0; box-sizing: border-box; }\n    body {\n      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;\n      line-height: 1.6;\n      color: #e0e0e0;\n      background-color: #0a0a0a;\n      padding: 20px 10px;\n    }\n    .container {\n      max-width: 1280px;\n      margin: 0 auto;\n      padding: 30px;\n      background-color: #121212;\n      box-shadow: 0 0 30px rgba(0,0,0,0.7);\n      border: 1px solid #1f1f1f;\n      border-radius: 12px;\n      min-height: 100vh;\n    }\n    .header {\n      background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);\n      color: white;\n      padding: 50px 40px;\n      margin: -30px -30px 40px -30px;\n      border-radius: 12px 12px 0 0;\n    }\n    .header h1 {\n      font-size: 32px;\n      margin-bottom: 12px;\n    }\n    .header .subtitle {\n      font-size: 18px;\n      opacity: 0.95;\n    }\n    .meta-info {\n      background-color: #1e1e1e;\n      border-left: 5px solid #60a5fa;\n      padding: 18px 25px;\n      margin-bottom: 35px;\n      border-radius: 8px;\n    }\n    h2 {\n      color: #60a5fa;\n      font-size: 26px;\n      margin: 45px 0 20px 0;\n      padding-bottom: 12px;\n      border-bottom: 2px solid #252525;\n    }\n    h3, h4 {\n      color: #90caf9;\n    }\n    .stats-grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));\n      gap: 20px;\n      margin: 20px 0;\n    }\n    .stat-card {\n      background-color: #1e1e1e;\n      padding: 20px;\n      border-radius: 8px;\n      border-left: 4px solid #60a5fa;\n    }\n    .stat-card .label {\n      font-size: 14px;\n      color: #9e9e9e;\n      margin-bottom: 8px;\n    }\n    .stat-card .value {\n      font-size: 32px;\n      font-weight: bold;\n      color: #90caf9;\n    }\n    .severity-breakdown {\n      display: flex;\n      gap: 15px;\n      margin: 20px 0;\n      flex-wrap: wrap;\n    }\n    .severity-item {\n      flex: 1;\n      min-width: 120px;\n      padding: 15px;\n      background-color: #1e1e1e;\n      border-radius: 6px;\n      text-align: center;\n      border-top: 4px solid;\n    }\n    .severity-item .count {\n      font-size: 28px;\n      font-weight: bold;\n      margin-bottom: 5px;\n    }\n    .severity-badge {\n      display: inline-block;\n      padding: 4px 12px;\n      border-radius: 20px;\n      font-size: 12px;\n      font-weight: 600;\n      text-transform: uppercase;\n    }\n    .service-table {\n      width: 100%;\n      border-collapse: collapse;\n      margin: 20px 0;\n      background-color: #1a1a1a;\n      border-radius: 8px;\n      overflow: hidden;\n    }\n    .service-table th,\n    .service-table td {\n      padding: 12px;\n      text-align: left;\n      border-bottom: 1px solid #252525;\n    }\n    .service-table th {\n      background-color: #1f1f1f;\n      color: #90caf9;\n      font-weight: 600;\n    }\n    .service-table tr:hover {\n      background-color: #252525;\n    }\n    .port-section {\n      margin: 30px 0;\n      padding: 20px;\n      background-color: #1e1e1e;\n      border-radius: 8px;\n    }\n    .port-title {\n      color: #64b5f6;\n      margin-bottom: 10px;\n    }\n    .service-info {\n      margin: 10px 0;\n      padding: 10px;\n      background-color: #252525;\n      border-radius: 4px;\n      font-size: 14px;\n    }\n    .no-vuln {\n      margin: 15px 0;\n      padding: 15px;\n      background-color: #1b5e20;\n      color: #81c784;\n      border-radius: 4px;\n    }\n    .vulnerability-card {\n      margin: 15px 0;\n      padding: 20px;\n      background-color: #1e1e1e;\n      border-radius: 6px;\n      border-left: 4px solid #ff9800;\n    }\n    .vuln-header {\n      display: flex;\n      gap: 15px;\n      align-items: center;\n      margin-bottom: 10px;\n    }\n    .cve-id {\n      font-size: 18px;\n      font-weight: bold;\n      color: #90caf9;\n    }\n    .cvss-score {\n      font-size: 14px;\n      font-weight: 600;\n      color: #9e9e9e;\n    }\n    .vuln-published {\n      font-size: 13px;\n      color: #9e9e9e;\n      margin-bottom: 10px;\n    }\n    .vuln-description {\n      margin: 15px 0;\n      line-height: 1.7;\n    }\n    .recommendations {\n      background-color: #263238;\n      padding: 25px;\n      border-radius: 8px;\n      border-left: 5px solid #ff9800;\n      margin: 30px 0;\n    }\n    .footer {\n      text-align: center;\n      color: #546e7a;\n      margin-top: 80px;\n      font-size: 0.95rem;\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <div class=\"header\">\n      <h1>${meta.title}</h1>\n      <div class=\"subtitle\">${meta.subtitle}</div>\n    </div>\n\n    <div class=\"meta-info\">\n      <div><strong>Target Network:</strong> ${meta.scanNetwork}</div>\n      <div><strong>Scan Date:</strong> ${meta.scanDate} ${meta.scanTime}</div>\n      <div><strong>Report Version:</strong> ${meta.version}</div>\n    </div>\n\n    <h2>Executive Summary</h2>\n    <div class=\"executive-summary\">\n      ${report.executiveSummary}\n    </div>\n\n    <h2>Overall Statistics</h2>\n    <div class=\"stats-grid\">\n      <div class=\"stat-card\">\n        <div class=\"label\">Total Hosts</div>\n        <div class=\"value\">${stats.totalHosts}</div>\n      </div>\n      <div class=\"stat-card\">\n        <div class=\"label\">Total Services</div>\n        <div class=\"value\">${stats.totalServices}</div>\n      </div>\n      <div class=\"stat-card\">\n        <div class=\"label\">Total Vulnerabilities</div>\n        <div class=\"value\">${stats.totalVulnerabilities}</div>\n      </div>\n    </div>\n\n    <h3>Vulnerability Breakdown by Severity</h3>\n    <div class=\"severity-breakdown\">\n      <div class=\"severity-item\" style=\"border-top-color: ${severityColor('critical')}\">\n        <div class=\"count\" style=\"color: ${severityColor('critical')}\">${stats.criticalCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('critical')}\">Critical</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top-color: ${severityColor('high')}\">\n        <div class=\"count\" style=\"color: ${severityColor('high')}\">${stats.highCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('high')}\">High</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top-color: ${severityColor('medium')}\">\n        <div class=\"count\" style=\"color: ${severityColor('medium')}\">${stats.mediumCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('medium')}\">Medium</div>\n      </div>\n      <div class=\"severity-item\" style=\"border-top-color: ${severityColor('low')}\">\n        <div class=\"count\" style=\"color: ${severityColor('low')}\">${stats.lowCount}</div>\n        <div class=\"label\" style=\"color: ${severityColor('low')}\">Low</div>\n      </div>\n    </div>\n\n    <h2>Detailed Findings by Host</h2>`;\n\nfor (const ip in hosts) {\n  const host = hosts[ip];\n  html += `\n    <h3>Host: ${host.ip}</h3>\n    <h4>Discovered Services</h4>\n    ${generateServiceTable(host)}\n    <h4>Vulnerability Details</h4>\n    ${generateVulnerabilityDetails(host)}`;\n}\n\nhtml += `\n    <h2>Recommendations</h2>\n    <div class=\"recommendations\">\n      <p><strong>Immediate Actions:</strong></p>\n      <ul>\n        <li>Prioritize patching of CRITICAL and HIGH severity vulnerabilities</li>\n        <li>Review and update all services showing outdated versions</li>\n        <li>Disable or restrict access to unnecessary services</li>\n        <li>Implement network segmentation to limit exposure</li>\n      </ul>\n      <p><strong>Long-term Improvements:</strong></p>\n      <ul>\n        <li>Establish regular vulnerability scanning schedule (weekly/monthly)</li>\n        <li>Implement automated patch management processes</li>\n        <li>Deploy intrusion detection/prevention systems (IDS/IPS)</li>\n        <li>Conduct security awareness training for staff</li>\n        <li>Maintain asset inventory and track software versions</li>\n      </ul>\n    </div>\n\n    <div class=\"footer\">\n      Report generated by n8n • ${new Date().toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'})}\n    </div>\n  </div>\n</body>\n</html>`;\n\nconst buffer = Buffer.from(html, 'utf-8');\n\nreturn [{\n  json: { html: html },\n  binary: {\n    data: {\n      data: buffer.toString('base64'),\n      mimeType: 'text/html',\n      fileName: `vulnerability_report_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.html`\n    }\n  }\n}];"
+      },
+      "id": "9eb39283-60f1-4baa-a0f4-aaf03e60e71a",
+      "name": "9. Generate HTML Report1",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2880,
+        336
+      ],
+      "typeVersion": 2,
+      "notes": "Professional HTML report with styling"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Pre-Set-Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-Set-Target": {
+      "main": [
+        [
+          {
+            "node": "1. Set Parameters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Pre-Set-Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6. Save Enriched Data": {
+      "main": [
+        [
+          {
+            "node": "7. Aggregate All Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7. Aggregate All Data": {
+      "main": [
+        [
+          {
+            "node": "8. Prepare Report Structure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5. CVE Enrichment Loop": {
+      "main": [
+        [
+          {
+            "node": "6. Save Enriched Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "10. Save Report to File": {
+      "main": [
+        [
+          {
+            "node": "11. Read Report for Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "9. Generate HTML Report": {
+      "main": [
+        []
+      ]
+    },
+    "4. Save Scan Data to File": {
+      "main": [
+        [
+          {
+            "node": "5. CVE Enrichment Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "8. Prepare Report Structure": {
+      "main": [
+        [
+          {
+            "node": "9. Generate HTML Report1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "13. Read Report PDF for Output": {
+      "main": [
+        [
+          {
+            "node": "14/a. Send Report in Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Parse NMAP JSON to Services": {
+      "main": [
+        [
+          {
+            "node": "4. Save Scan Data to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Set Parameters": {
+      "main": [
+        [
+          {
+            "node": "Optional Params Setter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command": {
+      "main": [
+        [
+          {
+            "node": "3. Parse NMAP JSON to Services",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Optional Params Setter": {
+      "main": [
+        [
+          {
+            "node": "Execute a command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "11. Read Report for Output": {
+      "main": [
+        [
+          {
+            "node": "Execute a command1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a command1": {
+      "main": [
+        [
+          {
+            "node": "13. Read Report PDF for Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Pre-Set-Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "9. Generate HTML Report1": {
+      "main": [
+        [
+          {
+            "node": "10. Save Report to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "e6e7be10-e877-439c-87dd-680aa282a761",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1def1184468e8985f5e1dd74fce03b0084b03afcf8d37aec4e5a3c3bd9bd0328"
+  },
+  "id": "vWlLlRf5Oosjc6GyViX-M",
+  "tags": []
+}
